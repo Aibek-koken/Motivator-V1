@@ -1,7 +1,5 @@
 """
 Qaiyrat Bot — точка входа.
-Сейчас подключён только /memory.
-Остальные модули добавим по очереди.
 """
 
 import logging
@@ -11,12 +9,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from telegram import Update, BotCommand
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    filters,
-)
+from telegram.ext import Application, CallbackQueryHandler
 from handlers.memory import build_memory_handler, memory_callback
+from handlers.tasks import build_tasks_handler, tasks_callback
 
 logging.basicConfig(
     format="%(asctime)s · %(name)s · %(levelname)s · %(message)s",
@@ -26,13 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 async def post_init(app: Application) -> None:
-    """Устанавливаем команды в меню Telegram."""
     await app.bot.set_my_commands([
-        BotCommand("memory",  "🗂 Память прошлого — фото, тексты, ссылки"),
-        BotCommand("future",  "🌅 Проектирование будущего"),
-        BotCommand("psycho",  "🧠 Мотиватор"),
-        BotCommand("tasks",   "✅ Задачи"),
-        BotCommand("help",    "❓ Помощь"),
+        BotCommand("memory", "🗂 Память прошлого — фото, тексты, ссылки"),
+        BotCommand("tasks",  "✅ Задачи"),
+        BotCommand("future", "🌅 Проектирование будущего"),
+        BotCommand("psycho", "🧠 Мотиватор"),
+        BotCommand("help",   "❓ Помощь"),
     ])
 
 
@@ -48,13 +42,15 @@ def main() -> None:
         .build()
     )
 
-    # /memory — ConversationHandler (фото, текст, ссылки)
+    # /memory
     app.add_handler(build_memory_handler())
-
-    # Callback-кнопки памяти (закрепить, удалить, фильтр)
     app.add_handler(CallbackQueryHandler(memory_callback, pattern="^mem_"))
 
-    logger.info("Qaiyrat запущен ✅  /memory готов")
+    # /tasks
+    app.add_handler(build_tasks_handler())
+    app.add_handler(CallbackQueryHandler(tasks_callback, pattern="^tsk_"))
+
+    logger.info("Qaiyrat запущен ✅  /memory + /tasks готовы")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
