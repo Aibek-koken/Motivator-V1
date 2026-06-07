@@ -131,3 +131,130 @@ def generate_anchor_response(profile: dict, victory: Optional[str]) -> str:
         ],
     )
     return response.choices[0].message.content
+# ──────────────────────────────────────────────
+# /future — проектирование будущего (заглушка)
+# ──────────────────────────────────────────────
+
+FUTURE_QUESTIONS = [
+    {
+        "step": 1,
+        "field": "dream",
+        "question": "🌅 <b>О чём ты мечтаешь?</b>\n\nЕсли бы у тебя было достаточно денег, времени и не было страха — что бы ты хотел создать, изменить или пережить в своей жизни?",
+        "next_step": 2
+    },
+    {
+        "step": 2,
+        "field": "dream_why",
+        "question": "💭 <b>Почему это так важно для тебя?</b>\n\nЧто стоит за этой мечтой? Какие чувства или смыслы она даёт?",
+        "next_step": 3
+    },
+    {
+        "step": 3,
+        "field": "values",
+        "question": "⭐ <b>Какие ценности для тебя главные?</b>\n\nНапример: свобода, семья, честность, развитие, здоровье, признание. Напиши несколько через запятую.",
+        "next_step": 4,
+        "parse_list": True
+    },
+    {
+        "step": 4,
+        "field": "fears",
+        "question": "😟 <b>Чего ты боишься?</b>\n\nЧто может помешать тебе на пути к мечте? Какие страхи тебя останавливают?",
+        "next_step": 5,
+        "parse_list": True
+    },
+    {
+        "step": 5,
+        "field": "people",
+        "question": "👥 <b>Кто тебя поддерживает или для кого это важно?</b>\n\nНазови людей, которые верят в тебя, или тех, на кого ты хочешь повлиять. Например: «мама — хочу её обеспечить», «друг Азамат — верит в мой стартап».",
+        "next_step": 6,
+        "parse_people": True
+    },
+    {
+        "step": 6,
+        "field": "energy_sources",
+        "question": "⚡ <b>Что тебя заряжает энергией?</b>\n\nЭто могут быть места, музыка, книги, занятия, фильмы. Напиши несколько вещей, которые дают тебе силы.",
+        "next_step": 7,
+        "parse_list": True
+    },
+    {
+        "step": 7,
+        "field": "favorite_tracks",
+        "question": "🎵 <b>Назови одну песню или трек, который даёт тебе крылья.</b>\n\nНапиши название и исполнителя. Почему именно она?",
+        "next_step": 8,
+        "parse_track": True
+    },
+    {
+        "step": 8,
+        "field": "anchor_phrase",
+        "question": "⚓ <b>Придумай личную фразу-якорь.</b>\n\nКороткую фразу, которая вернёт тебя к твоей цели в трудный момент. Например: «Я делаю это ради мамы» или «Однажды я уже справился — смогу и сейчас».",
+        "next_step": None,
+        "is_last": True
+    }
+]
+
+def get_next_future_question(step: int, last_answer: str = None) -> dict:
+    """
+    Возвращает следующий вопрос или сигнал завершения.
+    step: номер только что отвеченного шага (или 0 для первого).
+    """
+    if step == 0:
+        q = FUTURE_QUESTIONS[0]
+        return {
+            "question": q["question"],
+            "field": q["field"],
+            "next_step": q["step"],
+            "is_last": False,
+            "step": q["step"]
+        }
+    # Ищем текущий шаг
+    for i, q in enumerate(FUTURE_QUESTIONS):
+        if q["step"] == step:
+            if q.get("is_last"):
+                return {"is_complete": True}
+            next_q = FUTURE_QUESTIONS[i+1] if i+1 < len(FUTURE_QUESTIONS) else None
+            if next_q:
+                return {
+                    "question": next_q["question"],
+                    "field": next_q["field"],
+                    "next_step": next_q["step"],
+                    "is_last": next_q.get("is_last", False),
+                    "step": next_q["step"]
+                }
+            else:
+                return {"is_complete": True}
+    # Не найден — начинаем сначала
+    return get_next_future_question(0)
+
+def parse_future_answer(field: str, answer: str) -> dict:
+    """Преобразует ответ в формат для обновления future_profile."""
+    answer = answer.strip()
+    if field in ("values", "fears", "energy_sources"):
+        items = [i.strip() for i in answer.split(",") if i.strip()]
+        return {field: items}
+    elif field == "people":
+        people_list = []
+        for line in answer.split("\n"):
+            if " — " in line:
+                name, role = line.split(" — ", 1)
+            elif " - " in line:
+                name, role = line.split(" - ", 1)
+            elif "," in line:
+                name, role = line.split(",", 1)
+            else:
+                name, role = line, "поддержка"
+            people_list.append({"name": name.strip(), "role": role.strip()})
+        return {"people": people_list}
+    elif field == "favorite_tracks":
+        track = {}
+        if " - " in answer:
+            title, artist = answer.split(" - ", 1)
+        elif "," in answer:
+            title, artist = answer.split(",", 1)
+        else:
+            title, artist = answer, "неизвестен"
+        track["title"] = title.strip()
+        track["artist"] = artist.strip()
+        track["why"] = ""
+        return {"favorite_tracks": [track]}
+    else:
+        return {field: answer}

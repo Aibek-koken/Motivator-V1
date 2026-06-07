@@ -1,7 +1,7 @@
 """
 Qaiyrat Bot — точка входа.
 """
-
+from handlers.future import build_future_handler, future_callback
 import logging
 import os
 from dotenv import load_dotenv
@@ -49,6 +49,10 @@ def main() -> None:
     # /tasks
     app.add_handler(build_tasks_handler())
     app.add_handler(CallbackQueryHandler(tasks_callback, pattern="^tsk_"))
+
+        # /future
+    app.add_handler(build_future_handler())
+    app.add_handler(CallbackQueryHandler(future_callback, pattern="^future_"))
 
     logger.info("Qaiyrat запущен ✅  /memory + /tasks готовы")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

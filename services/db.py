@@ -308,3 +308,13 @@ def answer_checkin(checkin_id: int, answer: str) -> None:
         "answer": answer,
         "answered_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", checkin_id).execute()
+
+
+# ══════════════════════════════════════════════
+# FUTURE MODE GETTER (добавить, если нет)
+# ══════════════════════════════════════════════
+
+def get_future_mode(telegram_id: int) -> bool:
+    """Вернуть True, если пользователь в режиме /future."""
+    user = get_user(telegram_id)
+    return user.get("in_future_mode", False) if user else False
