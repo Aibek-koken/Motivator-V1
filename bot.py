@@ -1,7 +1,6 @@
 """
 Qaiyrat Bot — точка входа.
 """
-from handlers.future import build_future_handler, future_callback
 import logging
 import os
 from dotenv import load_dotenv
@@ -9,9 +8,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from telegram import Update, BotCommand
-from telegram.ext import Application, CallbackQueryHandler
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+)
+
 from handlers.memory import build_memory_handler, memory_callback
 from handlers.tasks import build_tasks_handler, tasks_callback
+from handlers.future import build_future_handler, future_callback
+from handlers.psycho import (
+    build_psycho_handler,
+    psycho_callback,
+    psycho_handle_message,
+    psycho_end,
+    psycho_end_mood,
+)
 
 logging.basicConfig(
     format="%(asctime)s · %(name)s · %(levelname)s · %(message)s",
@@ -42,19 +56,31 @@ def main() -> None:
         .build()
     )
 
-    # /memory
+    # ─── /memory ──────────────────────────────────────────
     app.add_handler(build_memory_handler())
     app.add_handler(CallbackQueryHandler(memory_callback, pattern="^mem_"))
 
-    # /tasks
+    # ─── /tasks ───────────────────────────────────────────
     app.add_handler(build_tasks_handler())
     app.add_handler(CallbackQueryHandler(tasks_callback, pattern="^tsk_"))
 
-        # /future
+    # ─── /future ──────────────────────────────────────────
     app.add_handler(build_future_handler())
     app.add_handler(CallbackQueryHandler(future_callback, pattern="^future_"))
 
-    logger.info("Qaiyrat запущен ✅  /memory + /tasks готовы")
+    # ─── /psycho ──────────────────────────────────────────
+    # Стартовый диалог (оценка настроения)
+    app.add_handler(build_psycho_handler()) 
+    # Кнопки внутри сессии
+    app.add_handler(CallbackQueryHandler(psycho_callback, pattern="^psycho_"))
+    # Команда ручного завершения
+    app.add_handler(CommandHandler("psycho_end", psycho_end))
+    # Оценка настроения после завершения
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, psycho_end_mood))
+    # Основной обработчик сообщений, когда активен режим психолога
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, psycho_handle_message))
+
+    logger.info("✅ Qaiyrat запущен — активны /memory, /tasks, /future, /psycho")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

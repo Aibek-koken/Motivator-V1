@@ -318,3 +318,18 @@ def get_future_mode(telegram_id: int) -> bool:
     """Вернуть True, если пользователь в режиме /future."""
     user = get_user(telegram_id)
     return user.get("in_future_mode", False) if user else False
+
+# ══════════════════════════════════════════════
+# PSYCHO — ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ
+# ══════════════════════════════════════════════
+
+def update_psycho_mood_before(session_id: int, mood: int) -> None:
+    """Сохранить настроение до начала сессии (1-5)."""
+    db = get_db()
+    db.table("psycho_sessions").update({"mood_before": mood}).eq("id", session_id).execute()
+
+
+def get_psycho_mode(telegram_id: int) -> bool:
+    """Вернуть True, если пользователь в активной психо-сессии."""
+    user = get_user(telegram_id)
+    return user.get("in_psycho_mode", False) if user else False
