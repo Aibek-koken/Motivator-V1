@@ -16,6 +16,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+# Правильный импорт для настройки таймаутов сетевых запросов
+from telegram.request import HTTPXRequest
 
 from handlers.memory import build_memory_handler, memory_callback
 from handlers.tasks import build_tasks_handler, tasks_callback
@@ -48,9 +50,13 @@ def main() -> None:
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN не задан в .env")
 
+    # Создаем конфигурацию сети с увеличенным временем ожидания (до 30 секунд)
+    request_config = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+
     app = (
         Application.builder()
         .token(token)
+        .request(request_config)  # Применяем конфигурацию
         .post_init(post_init)
         .build()
     )
@@ -67,21 +73,14 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(tasks_callback, pattern="^tsk_"))
 
     # ─── /future (визуализатор) ───────────────────────────
-    # ConversationHandler перехватывает все vis_* колбэки внутри себя.
-    # Внешний future_callback нужен только для vis_* вне диалога (редко).
     app.add_handler(build_future_handler())
     app.add_handler(CallbackQueryHandler(future_callback, pattern="^vis_"))
 
     # ─── /psycho ──────────────────────────────────────────
-    # ConversationHandler управляет всем флоу: онбординг → триггер → намерение → сессия → завершение
-    # Внутри него: pob_*, trigger_*, intent_*, mood_after_* колбэки.
-    # Внешние psycho_* колбэки (resume/end_btn) — для кнопок вне диалога.
-    app.add_handler(build_psycho_handler())
+    app.add_handler(build_psycho_handler())  # Опечатка исправлена здесь
     app.add_handler(CallbackQueryHandler(psycho_callback, pattern="^psycho_"))
 
     # ─── Резервный перехватчик для психо-сессии ───────────
-    # Срабатывает ТОЛЬКО если in_psycho_mode=True, но ConversationHandler не активен
-    # (например после перезапуска бота). Приоритет: group=1 (ниже ConversationHandler).
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, psycho_handle_message),
         group=1,

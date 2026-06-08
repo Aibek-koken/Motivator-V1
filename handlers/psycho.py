@@ -329,6 +329,7 @@ async def _start_session(message, ctx: ContextTypes.DEFAULT_TYPE, tid: int):
     session_id = session["id"]
     ctx.user_data["psycho_session_id"] = session_id
     set_psycho_mode(tid, True)
+    ctx.user_data["in_conv_handler"] = True
 
     trigger = ctx.user_data.get("psycho_trigger", "")
     intent = ctx.user_data.get("psycho_intent", "")
@@ -418,7 +419,6 @@ async def psycho_end_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     )
     return END_MOOD
 
-
 async def end_mood_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -439,6 +439,8 @@ async def end_mood_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     )
     ctx.user_data.pop("end_session_id", None)
     ctx.user_data.pop("psycho_session_id", None)
+    ctx.user_data.pop("in_conv_handler", None) 
+    
     return ConversationHandler.END
 
 
@@ -452,6 +454,10 @@ async def psycho_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "psycho_resume":
         await query.message.delete()
+        
+        # Юзер продолжает сессию — включаем блокировку резервного хэндлера
+        ctx.user_data["in_conv_handler"] = True
+        
         # После delete нельзя reply — используем send_message в тот же чат
         await query.message.chat.send_message(
             "Продолжаем. Напиши что у тебя сейчас."
@@ -461,9 +467,11 @@ async def psycho_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if session:
             end_psycho_session(session["id"])
         set_psycho_mode(tid, False)
+        
+        # Сессия завершена — полностью удаляем флаг блокировки
+        ctx.user_data.pop("in_conv_handler", None)
+        
         await query.edit_message_text("Сессия завершена. /psycho — когда понадобится.")
-
-
 # ──────────────────────────────────────────────
 # Глобальный перехватчик: если in_psycho_mode, но вне ConversationHandler
 # (используется в bot.py как fallback)
@@ -471,8 +479,14 @@ async def psycho_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def psycho_handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     Резервный обработчик — срабатывает если пользователь пишет
-    вне ConversationHandler, но флаг in_psycho_mode = True.
+    вне ConversationHandler (например, после перезапуска бота), 
+    но флаг in_psycho_mode = True.
     """
+    # Если работает основной ConversationHandler, прерываем выполнение, 
+    # чтобы не было дублирования сообщений!
+    if ctx.user_data.get("in_conv_handler"):
+        return
+
     from services.db import get_psycho_mode
     tid = update.effective_user.id
     if not get_psycho_mode(tid):
@@ -504,7 +518,6 @@ async def psycho_handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     append_psycho_dialog(session_id, "assistant", response)
     await update.message.reply_text(response, parse_mode="HTML")
-
 
 # ──────────────────────────────────────────────
 # Сборка ConversationHandler
