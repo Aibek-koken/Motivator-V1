@@ -23,8 +23,6 @@ from handlers.psycho import (
     build_psycho_handler,
     psycho_callback,
     psycho_handle_message,
-    psycho_end,
-    psycho_end_mood,
 )
 
 logging.basicConfig(
@@ -38,8 +36,8 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("memory", "🗂 Память прошлого — фото, тексты, ссылки"),
         BotCommand("tasks",  "✅ Задачи"),
-        BotCommand("future", "🌅 Проектирование будущего"),
-        BotCommand("psycho", "🧠 Мотиватор"),
+        BotCommand("future", "🌅 Визуализатор будущего"),
+        BotCommand("psycho", "🧠 Психолог-мотиватор"),
         BotCommand("help",   "❓ Помощь"),
     ])
 
@@ -64,23 +62,28 @@ def main() -> None:
     app.add_handler(build_tasks_handler())
     app.add_handler(CallbackQueryHandler(tasks_callback, pattern="^tsk_"))
 
-    # ─── /future ──────────────────────────────────────────
+    # ─── /future (визуализатор) ───────────────────────────
+    # ConversationHandler перехватывает все vis_* колбэки внутри себя.
+    # Внешний future_callback нужен только для vis_* вне диалога (редко).
     app.add_handler(build_future_handler())
-    app.add_handler(CallbackQueryHandler(future_callback, pattern="^future_"))
+    app.add_handler(CallbackQueryHandler(future_callback, pattern="^vis_"))
 
     # ─── /psycho ──────────────────────────────────────────
-    # Стартовый диалог (оценка настроения)
-    app.add_handler(build_psycho_handler()) 
-    # Кнопки внутри сессии
+    # ConversationHandler управляет всем флоу: онбординг → триггер → намерение → сессия → завершение
+    # Внутри него: pob_*, trigger_*, intent_*, mood_after_* колбэки.
+    # Внешние psycho_* колбэки (resume/end_btn) — для кнопок вне диалога.
+    app.add_handler(build_psycho_handler())
     app.add_handler(CallbackQueryHandler(psycho_callback, pattern="^psycho_"))
-    # Команда ручного завершения
-    app.add_handler(CommandHandler("psycho_end", psycho_end))
-    # Оценка настроения после завершения
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, psycho_end_mood))
-    # Основной обработчик сообщений, когда активен режим психолога
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, psycho_handle_message))
 
-    logger.info("✅ Qaiyrat запущен — активны /memory, /tasks, /future, /psycho")
+    # ─── Резервный перехватчик для психо-сессии ───────────
+    # Срабатывает ТОЛЬКО если in_psycho_mode=True, но ConversationHandler не активен
+    # (например после перезапуска бота). Приоритет: group=1 (ниже ConversationHandler).
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, psycho_handle_message),
+        group=1,
+    )
+
+    logger.info("✅ Qaiyrat запущен — /memory /tasks /future /psycho")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

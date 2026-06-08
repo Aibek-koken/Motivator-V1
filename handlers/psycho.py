@@ -1,185 +1,536 @@
-# handlers/psycho.py
+"""
+handlers/psycho.py — Психолог-мотиватор с умным онбордингом.
+
+Логика:
+  - Первый запуск: короткий онбординг (4-5 вопросов) для сбора psycho_profile
+  - Если профиль неполный: доспрашиваем только недостающее
+  - Если профиль полный: сразу в сессию (только триггер + намерение)
+  - Во время сессии: AI использует весь профиль + историю + победы из Cookie Jar
+"""
 import logging
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters
-from services.db import (
-    get_user, set_psycho_mode, start_psycho_session, get_active_psycho_session,
-    append_psycho_dialog, end_psycho_session, get_future_profile, get_random_victory,
-    update_psycho_mood_before
+from telegram.ext import (
+    ContextTypes, ConversationHandler, CommandHandler,
+    CallbackQueryHandler, MessageHandler, filters,
 )
-from services.ai import generate_psycho_response
+from services.db import (
+    get_user, set_psycho_mode,
+    start_psycho_session, get_active_psycho_session,
+    append_psycho_dialog, end_psycho_session,
+    get_future_profile, get_random_victory,
+    update_psycho_mood_before,
+    get_psycho_profile, upsert_psycho_profile,
+)
+from services.ai import generate_psycho_response, generate_psycho_onboarding_response
 
 logger = logging.getLogger(__name__)
 
-# Состояния для ConversationHandler (только для сбора начальной оценки настроения)
-ASK_MOOD = 1
+# ──────────────────────────────────────────────
+# Состояния ConversationHandler
+# ──────────────────────────────────────────────
+ONBOARDING   = 1   # онбординг-вопросы (только первый раз)
+ASK_TRIGGER  = 2   # что сейчас происходит
+ASK_INTENT   = 3   # что хочешь от сессии
+IN_SESSION   = 4   # основной чат
+END_MOOD     = 5   # оценка настроения после
 
+# ──────────────────────────────────────────────
+# Онбординг: 4 ключевых вопроса
+# Основаны на: ACT-терапия, CBT-фреймворк, нейробиология стресса (кортизол, префронтальная кора)
+# ──────────────────────────────────────────────
+ONBOARDING_QUESTIONS = [
+    {
+        "key": "stress_pattern",
+        "text": (
+            "Когда тебе плохо или всё навалилось — как ты обычно реагируешь?\n\n"
+            "Выбери что ближе всего:"
+        ),
+        "buttons": [
+            ("🏃 Ухожу в себя, замолкаю", "pattern_freeze"),
+            ("😤 Злюсь, срываюсь на других", "pattern_fight"),
+            ("📱 Залипаю в телефоне / ем / сплю", "pattern_avoid"),
+            ("🔄 Думаю по кругу, не могу остановиться", "pattern_ruminate"),
+        ],
+    },
+    {
+        "key": "energy_killer",
+        "text": (
+            "Что чаще всего забирает у тебя энергию?\n\n"
+        ),
+        "buttons": [
+            ("😰 Страх что не справлюсь", "kill_fear"),
+            ("😞 Ощущение что топчусь на месте", "kill_stuck"),
+            ("🤝 Конфликты с людьми", "kill_people"),
+            ("🌪 Хаос — слишком много всего сразу", "kill_chaos"),
+        ],
+    },
+    {
+        "key": "support_type",
+        "text": (
+            "Когда тебе тяжело, что помогает больше всего?\n\n"
+        ),
+        "buttons": [
+            ("💬 Просто выговориться", "support_talk"),
+            ("🎯 Получить конкретный план", "support_plan"),
+            ("🔍 Понять почему так происходит", "support_insight"),
+            ("💪 Жёсткое слово — встряхнуться", "support_push"),
+        ],
+    },
+    {
+        "key": "comeback_resource",
+        "text": (
+            "Был ли у тебя момент когда ты думал что не вытянешь — но вытянул?\n\n"
+            "Напиши одним предложением. Это станет твоим ресурсом на трудные моменты.\n\n"
+            "<i>Например: «Сдал сессию на больничном» или «Поднял бизнес после первого провала»</i>"
+        ),
+        "free_text": True,
+    },
+]
+
+
+def _get_missing_onboarding_keys(profile: dict) -> list:
+    """Возвращает список незаполненных полей онбординга."""
+    required = ["stress_pattern", "energy_killer", "support_type", "comeback_resource"]
+    return [k for k in required if not profile.get(k)]
+
+
+def _onboarding_complete(profile: dict) -> bool:
+    return len(_get_missing_onboarding_keys(profile)) == 0
+
+
+def _make_onboarding_keyboard(question: dict) -> InlineKeyboardMarkup:
+    buttons = question.get("buttons", [])
+    rows = [[InlineKeyboardButton(label, callback_data=f"pob_{cb}")] for label, cb in buttons]
+    return InlineKeyboardMarkup(rows)
+
+
+# ──────────────────────────────────────────────
+# Точка входа: /psycho
+# ──────────────────────────────────────────────
 async def psycho_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Команда /psycho — начать сессию с мотиватором."""
     tid = update.effective_user.id
     user = get_user(tid)
     if not user:
         await update.message.reply_text("Сначала напиши /start.")
-        return -1
-    
-    # Проверяем, есть ли уже активная сессия
-    active_session = get_active_psycho_session(tid)
-    if active_session:
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🧠 Продолжить сессию", callback_data="psycho_resume"),
-            InlineKeyboardButton("❌ Завершить сессию", callback_data="psycho_end")
+        return ConversationHandler.END
+
+    # Есть активная сессия?
+    active = get_active_psycho_session(tid)
+    if active:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("▶️ Продолжить", callback_data="psycho_resume"),
+            InlineKeyboardButton("✖️ Завершить", callback_data="psycho_end_btn"),
         ]])
         await update.message.reply_text(
-            "🧠 <b>У тебя уже есть активная сессия с психологом.</b>\n\n"
-            "Хочешь продолжить разговор или завершить?",
-            parse_mode="HTML",
-            reply_markup=keyboard
+            "🧠 <b>Сессия уже идёт.</b>\n\nПродолжить или завершить?",
+            parse_mode="HTML", reply_markup=kb
         )
-        return -1
-    
-    # Спрашиваем настроение перед началом
-    ctx.user_data["psycho_session_id"] = None
+        return ConversationHandler.END
+
+    # Проверяем онбординг
+    psycho_profile = get_psycho_profile(tid)
+    missing = _get_missing_onboarding_keys(psycho_profile) if psycho_profile else list(
+        q["key"] for q in ONBOARDING_QUESTIONS
+    )
+
+    if missing:
+        # Нужен онбординг (полный или частичный)
+        ctx.user_data["psycho_onboarding_queue"] = missing
+        ctx.user_data["psycho_onboarding_data"] = {}
+        await _send_next_onboarding(update, ctx, first=True)
+        return ONBOARDING
+
+    # Профиль готов — спрашиваем триггер
+    await _ask_trigger(update, ctx)
+    return ASK_TRIGGER
+
+
+async def _send_next_onboarding(update: Update, ctx: ContextTypes.DEFAULT_TYPE, first: bool = False):
+    queue = ctx.user_data.get("psycho_onboarding_queue", [])
+    if not queue:
+        # Онбординг завершён
+        await _finish_onboarding(update, ctx)
+        return
+
+    key = queue[0]
+    question = next((q for q in ONBOARDING_QUESTIONS if q["key"] == key), None)
+    if not question:
+        queue.pop(0)
+        ctx.user_data["psycho_onboarding_queue"] = queue
+        await _send_next_onboarding(update, ctx)
+        return
+
+    total = len(ONBOARDING_QUESTIONS)
+    done = total - len(queue)
+    progress = f"<i>Шаг {done + 1} из {total}</i>\n\n"
+
+    if first:
+        intro = (
+            "🧠 <b>Пару вопросов перед стартом</b>\n\n"
+            "Мне нужно понять как ты устроен, чтобы помогать тебе точнее — не по шаблону.\n"
+            "Это займёт меньше минуты.\n\n"
+        )
+    else:
+        intro = ""
+
+    text = intro + progress + question["text"]
+
+    if question.get("free_text"):
+        await update.message.reply_text(text, parse_mode="HTML")
+    else:
+        await update.message.reply_text(
+            text, parse_mode="HTML",
+            reply_markup=_make_onboarding_keyboard(question)
+        )
+
+
+async def _finish_onboarding(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Сохраняем данные онбординга и переходим к сессии."""
+    tid = update.effective_user.id
+    data = ctx.user_data.get("psycho_onboarding_data", {})
+    upsert_psycho_profile(tid, data)
+
     await update.message.reply_text(
-        "🧠 <b>Психолог-мотиватор</b>\n\n"
-        "Привет. Я здесь, чтобы помочь тебе вернуть силы и ясность.\n"
-        "Но сначала оцени своё состояние от 1 до 5:\n"
-        "1 — совсем плохо, 5 — отлично.\n\n"
-        "<i>Напиши цифру.</i>",
+        "✅ <b>Готово. Теперь я знаю как тебе помогать.</b>\n\n"
+        "Переходим к главному — расскажи что сейчас происходит.",
         parse_mode="HTML"
     )
-    return ASK_MOOD
+    await _ask_trigger(update, ctx)
 
-async def psycho_mood_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получили оценку настроения, создаём сессию и начинаем диалог."""
+
+async def _ask_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("😔 Просто плохо, не знаю почему", callback_data="trigger_bad")],
+        [InlineKeyboardButton("🔥 Конкретная проблема / ситуация", callback_data="trigger_problem")],
+        [InlineKeyboardButton("📉 Нет мотивации, всё бросить", callback_data="trigger_quit")],
+        [InlineKeyboardButton("💬 Просто хочу поговорить", callback_data="trigger_talk")],
+    ])
+    await update.message.reply_text(
+        "Что сейчас происходит?",
+        reply_markup=kb
+    )
+
+
+# ──────────────────────────────────────────────
+# Онбординг: обработка кнопок
+# ──────────────────────────────────────────────
+async def onboarding_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # формат: pob_<value>
+
+    if not data.startswith("pob_"):
+        return ONBOARDING
+
+    value = data[4:]  # убираем "pob_"
+    queue = ctx.user_data.get("psycho_onboarding_queue", [])
+    if not queue:
+        return ONBOARDING
+
+    key = queue[0]
+    ctx.user_data["psycho_onboarding_data"][key] = value
+    ctx.user_data["psycho_onboarding_queue"] = queue[1:]
+
+    await query.message.delete()
+    # Следующий вопрос или завершение
+    remaining = ctx.user_data["psycho_onboarding_queue"]
+    if not remaining:
+        await _finish_onboarding(query.message, ctx)
+        return ASK_TRIGGER
+    else:
+        await _send_next_onboarding(query.message, ctx)
+        return ONBOARDING
+
+
+async def onboarding_free_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка текстового ответа на онбординг-вопрос (comeback_resource)."""
+    queue = ctx.user_data.get("psycho_onboarding_queue", [])
+    if not queue:
+        return ONBOARDING
+
+    key = queue[0]
+    question = next((q for q in ONBOARDING_QUESTIONS if q["key"] == key), None)
+    if not question or not question.get("free_text"):
+        return ONBOARDING
+
+    ctx.user_data["psycho_onboarding_data"][key] = update.message.text.strip()
+    ctx.user_data["psycho_onboarding_queue"] = queue[1:]
+
+    remaining = ctx.user_data["psycho_onboarding_queue"]
+    if not remaining:
+        await _finish_onboarding(update, ctx)
+        return ASK_TRIGGER
+    else:
+        await _send_next_onboarding(update, ctx)
+        return ONBOARDING
+
+
+# ──────────────────────────────────────────────
+# Триггер и намерение — быстрый ввод перед сессией
+# ──────────────────────────────────────────────
+async def trigger_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data  # trigger_bad / trigger_problem / trigger_quit / trigger_talk
+
+    trigger_labels = {
+        "trigger_bad": "просто плохо, без причины",
+        "trigger_problem": "конкретная проблема",
+        "trigger_quit": "нет мотивации, хочу всё бросить",
+        "trigger_talk": "просто поговорить",
+    }
+    ctx.user_data["psycho_trigger"] = trigger_labels.get(data, data)
+    await query.message.delete()
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Выговориться", callback_data="intent_talk")],
+        [InlineKeyboardButton("🎯 Получить план", callback_data="intent_plan")],
+        [InlineKeyboardButton("💪 Встряхнуться", callback_data="intent_push")],
+    ])
+    await query.message.reply_text(
+        "Чего ты хочешь от этой сессии?",
+        reply_markup=kb
+    )
+    return ASK_INTENT
+
+
+async def intent_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    intent_labels = {
+        "intent_talk": "выговориться",
+        "intent_plan": "получить конкретный план",
+        "intent_push": "встряхнуться, получить жёсткое слово",
+    }
+    ctx.user_data["psycho_intent"] = intent_labels.get(data, data)
+    await query.message.delete()
+
+    # Теперь начинаем сессию
     tid = update.effective_user.id
-    text = update.message.text.strip()
-    if not text.isdigit() or int(text) < 1 or int(text) > 5:
-        await update.message.reply_text("Пожалуйста, напиши число от 1 до 5.")
-        return ASK_MOOD
-    
-    mood = int(text)
-    # Создаём сессию
+    await _start_session(query, ctx, tid)
+    return IN_SESSION
+
+
+async def _start_session(query_or_update, ctx: ContextTypes.DEFAULT_TYPE, tid: int):
+    """Создаём сессию в БД, генерируем первое сообщение AI."""
     session = start_psycho_session(tid)
     session_id = session["id"]
-    update_psycho_mood_before(session_id, mood)
     ctx.user_data["psycho_session_id"] = session_id
-    
-    # Включаем флаг режима
     set_psycho_mode(tid, True)
-    
-    # Получаем профиль future для контекста
-    profile = get_future_profile(tid) or {}
-    victory = get_random_victory(tid)
-    
-    # Первое сообщение от психолога (AI)
-    welcome_msg = generate_psycho_response(profile, [], f"Моё настроение {mood}/5. Начнём.", victory)
-    await update.message.reply_text(welcome_msg, parse_mode="HTML")
-    
-    # Сохраняем в историю
-    append_psycho_dialog(session_id, "assistant", welcome_msg)
-    return -1  # завершаем ConversationHandler, дальше сообщения обрабатываются глобальным фильтром
 
-async def psycho_handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Обрабатывает любое текстовое сообщение, когда пользователь в режиме психолога.
-    Вызывается из bot.py, если in_psycho_mode == True.
-    """
+    trigger = ctx.user_data.get("psycho_trigger", "")
+    intent = ctx.user_data.get("psycho_intent", "")
+    psycho_profile = get_psycho_profile(tid) or {}
+    future_profile = get_future_profile(tid) or {}
+    victory = get_random_victory(tid)
+
+    first_msg = generate_psycho_onboarding_response(
+        psycho_profile=psycho_profile,
+        future_profile=future_profile,
+        trigger=trigger,
+        intent=intent,
+        victory=victory,
+    )
+
+    # Отправляем и сохраняем
+    msg = await query_or_update.message.reply_text(first_msg, parse_mode="HTML")
+    append_psycho_dialog(session_id, "assistant", first_msg)
+
+    # Подсказка как завершить
+    await query_or_update.message.reply_text(
+        "<i>Чтобы завершить сессию — /psycho_end</i>",
+        parse_mode="HTML"
+    )
+
+
+# ──────────────────────────────────────────────
+# Основной диалог в сессии
+# ──────────────────────────────────────────────
+async def session_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обрабатывает сообщения во время активной психо-сессии."""
     tid = update.effective_user.id
     user_msg = update.message.text.strip()
     if not user_msg:
-        return
-    
-    # Получаем активную сессию
+        return IN_SESSION
+
     session = get_active_psycho_session(tid)
     if not session:
-        # Флаг включён, но сессии нет — выключаем флаг
         set_psycho_mode(tid, False)
-        await update.message.reply_text("Сессия потеряна. Напиши /psycho, чтобы начать заново.")
-        return
-    
+        await update.message.reply_text(
+            "Сессия не найдена. Начни заново: /psycho"
+        )
+        return ConversationHandler.END
+
     session_id = session["id"]
-    # Сохраняем сообщение пользователя
     append_psycho_dialog(session_id, "user", user_msg)
-    
-    # Генерируем ответ AI
-    profile = get_future_profile(tid) or {}
+
+    psycho_profile = get_psycho_profile(tid) or {}
+    future_profile = get_future_profile(tid) or {}
     victory = get_random_victory(tid)
     history = session.get("dialog_history", [])
-    
-    # Отправляем "печатает"
+
     await update.message.chat.send_action(action="typing")
-    
-    response = generate_psycho_response(profile, history, user_msg, victory)
-    # Сохраняем ответ
+
+    response = generate_psycho_response(
+        psycho_profile=psycho_profile,
+        future_profile=future_profile,
+        history=history,
+        user_message=user_msg,
+        victory=victory,
+        intent=ctx.user_data.get("psycho_intent", ""),
+    )
     append_psycho_dialog(session_id, "assistant", response)
     await update.message.reply_text(response, parse_mode="HTML")
+    return IN_SESSION
 
-async def psycho_end(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Завершить сессию (команда /psycho_end или кнопка)."""
+
+# ──────────────────────────────────────────────
+# Завершение сессии
+# ──────────────────────────────────────────────
+async def psycho_end_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     tid = update.effective_user.id
     session = get_active_psycho_session(tid)
     if not session:
         await update.message.reply_text("Нет активной сессии.")
-        return
-    
-    # Спрашиваем настроение после
-    ctx.user_data["end_session_id"] = session["id"]
-    await update.message.reply_text(
-        "🧠 <b>Завершение сессии</b>\n\n"
-        "Оцени своё состояние сейчас от 1 до 5:",
-        parse_mode="HTML"
-    )
-    # Ожидаем ответ в следующем сообщении (используем следующий хендлер)
+        return ConversationHandler.END
 
-async def psycho_end_mood(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Получаем оценку после завершения."""
+    ctx.user_data["end_session_id"] = session["id"]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("1 😞", callback_data="mood_after_1"),
+         InlineKeyboardButton("2 😕", callback_data="mood_after_2"),
+         InlineKeyboardButton("3 😐", callback_data="mood_after_3"),
+         InlineKeyboardButton("4 🙂", callback_data="mood_after_4"),
+         InlineKeyboardButton("5 😊", callback_data="mood_after_5")],
+    ])
+    await update.message.reply_text(
+        "Оцени как ты сейчас — от 1 до 5:",
+        reply_markup=kb
+    )
+    return END_MOOD
+
+
+async def end_mood_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
     tid = update.effective_user.id
-    text = update.message.text.strip()
-    if not text.isdigit() or int(text) < 1 or int(text) > 5:
-        await update.message.reply_text("Напиши число от 1 до 5.")
-        return
-    
-    mood_after = int(text)
+
+    mood_after = int(query.data.split("_")[-1])
     session_id = ctx.user_data.get("end_session_id")
     if session_id:
         end_psycho_session(session_id, mood_after)
     set_psycho_mode(tid, False)
-    await update.message.reply_text(
-        "✅ Сессия завершена. Спасибо, что были со мной откровенны.\n"
-        "Если снова понадобится поддержка — я здесь. /psycho"
+
+    delta = ""
+    session = get_active_psycho_session(tid)  # уже закрыта, но mood_before может быть в ctx
+    # Просто закрываем красиво
+    await query.edit_message_text(
+        f"Принял. Сессия завершена.\n\n"
+        f"Возвращайся когда нужно — /psycho"
     )
     ctx.user_data.pop("end_session_id", None)
+    ctx.user_data.pop("psycho_session_id", None)
+    return ConversationHandler.END
 
+
+# ──────────────────────────────────────────────
+# Кнопки: продолжить / завершить активную сессию
+# ──────────────────────────────────────────────
 async def psycho_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок от психолога."""
     query = update.callback_query
     await query.answer()
-    data = query.data
     tid = update.effective_user.id
-    
-    if data == "psycho_resume":
-        # Продолжить существующую сессию — ничего не делаем, просто убираем сообщение
+
+    if query.data == "psycho_resume":
         await query.message.delete()
-        await query.message.reply_text("Продолжаем разговор. Напиши, что у тебя на душе.")
-    elif data == "psycho_end":
-        # Завершить сессию
+        await query.message.reply_text(
+            "Продолжаем. Напиши что у тебя сейчас."
+        )
+    elif query.data == "psycho_end_btn":
         session = get_active_psycho_session(tid)
         if session:
             end_psycho_session(session["id"])
         set_psycho_mode(tid, False)
-        await query.edit_message_text("❌ Сессия завершена. Чтобы начать заново, напиши /psycho.")
-    else:
-        await query.edit_message_text("Неизвестная команда.")
+        await query.edit_message_text("Сессия завершена. /psycho — когда понадобится.")
 
-# Сборка ConversationHandler для начала сессии (опрос настроения)
-def build_psycho_handler():
-    from telegram.ext import ConversationHandler
+
+# ──────────────────────────────────────────────
+# Глобальный перехватчик: если in_psycho_mode, но вне ConversationHandler
+# (используется в bot.py как fallback)
+# ──────────────────────────────────────────────
+async def psycho_handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Резервный обработчик — срабатывает если пользователь пишет
+    вне ConversationHandler, но флаг in_psycho_mode = True.
+    """
+    from services.db import get_psycho_mode
+    tid = update.effective_user.id
+    if not get_psycho_mode(tid):
+        return
+
+    user_msg = update.message.text.strip()
+    session = get_active_psycho_session(tid)
+    if not session:
+        set_psycho_mode(tid, False)
+        await update.message.reply_text("Сессия потеряна. Начни заново: /psycho")
+        return
+
+    session_id = session["id"]
+    append_psycho_dialog(session_id, "user", user_msg)
+
+    psycho_profile = get_psycho_profile(tid) or {}
+    future_profile = get_future_profile(tid) or {}
+    victory = get_random_victory(tid)
+    history = session.get("dialog_history", [])
+
+    await update.message.chat.send_action(action="typing")
+    response = generate_psycho_response(
+        psycho_profile=psycho_profile,
+        future_profile=future_profile,
+        history=history,
+        user_message=user_msg,
+        victory=victory,
+        intent="",
+    )
+    append_psycho_dialog(session_id, "assistant", response)
+    await update.message.reply_text(response, parse_mode="HTML")
+
+
+# ──────────────────────────────────────────────
+# Сборка ConversationHandler
+# ──────────────────────────────────────────────
+def build_psycho_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[CommandHandler("psycho", psycho_start)],
         states={
-            ASK_MOOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, psycho_mood_received)],
+            ONBOARDING: [
+                CallbackQueryHandler(onboarding_button, pattern="^pob_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, onboarding_free_text),
+            ],
+            ASK_TRIGGER: [
+                CallbackQueryHandler(trigger_selected, pattern="^trigger_"),
+            ],
+            ASK_INTENT: [
+                CallbackQueryHandler(intent_selected, pattern="^intent_"),
+            ],
+            IN_SESSION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, session_message),
+                CommandHandler("psycho_end", psycho_end_command),
+            ],
+            END_MOOD: [
+                CallbackQueryHandler(end_mood_button, pattern="^mood_after_"),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", lambda u,c: u.message.reply_text("Отменено."))],
-        name="psycho_start_conv",
-        allow_reentry=True
+        fallbacks=[
+            CommandHandler("psycho_end", psycho_end_command),
+            CommandHandler("cancel", lambda u, c: (
+                set_psycho_mode(u.effective_user.id, False),
+                u.message.reply_text("Сессия прервана. /psycho — когда будешь готов.")
+            )),
+        ],
+        name="psycho_conv",
+        allow_reentry=True,
+        per_user=True,
+        per_chat=True,
     )
