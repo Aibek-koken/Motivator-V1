@@ -137,19 +137,23 @@ async def psycho_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         # Нужен онбординг (полный или частичный)
         ctx.user_data["psycho_onboarding_queue"] = missing
         ctx.user_data["psycho_onboarding_data"] = {}
-        await _send_next_onboarding(update, ctx, first=True)
+        await _send_next_onboarding(update.message, ctx, first=True)
         return ONBOARDING
 
     # Профиль готов — спрашиваем триггер
-    await _ask_trigger(update, ctx)
+    await _ask_trigger(update.message)
     return ASK_TRIGGER
 
 
-async def _send_next_onboarding(update: Update, ctx: ContextTypes.DEFAULT_TYPE, first: bool = False):
+async def _send_next_onboarding(message, ctx: ContextTypes.DEFAULT_TYPE, first: bool = False):
+    """
+    message: объект telegram.Message (НЕ Update).
+    Вызывать как: await _send_next_onboarding(update.message, ctx)
+                  или: await _send_next_onboarding(query.message, ctx)
+    """
     queue = ctx.user_data.get("psycho_onboarding_queue", [])
     if not queue:
-        # Онбординг завершён
-        await _finish_onboarding(update, ctx)
+        await _finish_onboarding(message, ctx)
         return
 
     key = queue[0]
@@ -157,7 +161,7 @@ async def _send_next_onboarding(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     if not question:
         queue.pop(0)
         ctx.user_data["psycho_onboarding_queue"] = queue
-        await _send_next_onboarding(update, ctx)
+        await _send_next_onboarding(message, ctx)
         return
 
     total = len(ONBOARDING_QUESTIONS)
@@ -176,36 +180,40 @@ async def _send_next_onboarding(update: Update, ctx: ContextTypes.DEFAULT_TYPE, 
     text = intro + progress + question["text"]
 
     if question.get("free_text"):
-        await update.message.reply_text(text, parse_mode="HTML")
+        await message.reply_text(text, parse_mode="HTML")
     else:
-        await update.message.reply_text(
+        await message.reply_text(
             text, parse_mode="HTML",
             reply_markup=_make_onboarding_keyboard(question)
         )
 
 
-async def _finish_onboarding(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Сохраняем данные онбординга и переходим к сессии."""
-    tid = update.effective_user.id
+async def _finish_onboarding(message, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    message: объект telegram.Message.
+    Сохраняем данные онбординга и переходим к триггеру.
+    """
+    tid = message.chat.id
     data = ctx.user_data.get("psycho_onboarding_data", {})
     upsert_psycho_profile(tid, data)
 
-    await update.message.reply_text(
+    await message.reply_text(
         "✅ <b>Готово. Теперь я знаю как тебе помогать.</b>\n\n"
         "Переходим к главному — расскажи что сейчас происходит.",
         parse_mode="HTML"
     )
-    await _ask_trigger(update, ctx)
+    await _ask_trigger(message)
 
 
-async def _ask_trigger(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def _ask_trigger(message):
+    """message: объект telegram.Message."""
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("😔 Просто плохо, не знаю почему", callback_data="trigger_bad")],
         [InlineKeyboardButton("🔥 Конкретная проблема / ситуация", callback_data="trigger_problem")],
         [InlineKeyboardButton("📉 Нет мотивации, всё бросить", callback_data="trigger_quit")],
         [InlineKeyboardButton("💬 Просто хочу поговорить", callback_data="trigger_talk")],
     ])
-    await update.message.reply_text(
+    await message.reply_text(
         "Что сейчас происходит?",
         reply_markup=kb
     )
@@ -258,10 +266,10 @@ async def onboarding_free_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
 
     remaining = ctx.user_data["psycho_onboarding_queue"]
     if not remaining:
-        await _finish_onboarding(update, ctx)
+        await _finish_onboarding(update.message, ctx)
         return ASK_TRIGGER
     else:
-        await _send_next_onboarding(update, ctx)
+        await _send_next_onboarding(update.message, ctx)
         return ONBOARDING
 
 
@@ -307,14 +315,16 @@ async def intent_selected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
     ctx.user_data["psycho_intent"] = intent_labels.get(data, data)
     await query.message.delete()
 
-    # Теперь начинаем сессию
     tid = update.effective_user.id
-    await _start_session(query, ctx, tid)
+    await _start_session(query.message, ctx, tid)
     return IN_SESSION
 
 
-async def _start_session(query_or_update, ctx: ContextTypes.DEFAULT_TYPE, tid: int):
-    """Создаём сессию в БД, генерируем первое сообщение AI."""
+async def _start_session(message, ctx: ContextTypes.DEFAULT_TYPE, tid: int):
+    """
+    message: объект telegram.Message.
+    Создаём сессию в БД, генерируем первое сообщение AI.
+    """
     session = start_psycho_session(tid)
     session_id = session["id"]
     ctx.user_data["psycho_session_id"] = session_id
@@ -334,12 +344,10 @@ async def _start_session(query_or_update, ctx: ContextTypes.DEFAULT_TYPE, tid: i
         victory=victory,
     )
 
-    # Отправляем и сохраняем
-    msg = await query_or_update.message.reply_text(first_msg, parse_mode="HTML")
+    await message.reply_text(first_msg, parse_mode="HTML")
     append_psycho_dialog(session_id, "assistant", first_msg)
 
-    # Подсказка как завершить
-    await query_or_update.message.reply_text(
+    await message.reply_text(
         "<i>Чтобы завершить сессию — /psycho_end</i>",
         parse_mode="HTML"
     )
@@ -444,7 +452,8 @@ async def psycho_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "psycho_resume":
         await query.message.delete()
-        await query.message.reply_text(
+        # После delete нельзя reply — используем send_message в тот же чат
+        await query.message.chat.send_message(
             "Продолжаем. Напиши что у тебя сейчас."
         )
     elif query.data == "psycho_end_btn":
