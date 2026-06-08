@@ -4,6 +4,7 @@ Qaiyrat Bot — точка входа.
 import logging
 import os
 from dotenv import load_dotenv
+from handlers.onboarding import build_onboarding_handler
 
 load_dotenv()
 
@@ -53,6 +54,9 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
+
+    # ─── /start (Onboarding) ─────────────────────────────
+    app.add_handler(build_onboarding_handler())
 
     # ─── /memory ──────────────────────────────────────────
     app.add_handler(build_memory_handler())
