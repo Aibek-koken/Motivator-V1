@@ -291,3 +291,5 @@ create or replace view recent_wins as
 select *
 from wins
 order by created_at desc;
+
+notify pgrst, 'reload schema';

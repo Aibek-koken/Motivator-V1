@@ -9,7 +9,7 @@ import os
 
 from dotenv import load_dotenv
 from telegram import BotCommand, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
 
 from handlers.comeback import build_comeback_handler
@@ -25,6 +25,40 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _is_schema_error(error: object) -> bool:
+    text = str(error)
+    return any(
+        marker in text
+        for marker in (
+            "schema cache",
+            "does not exist",
+            "Could not find the",
+            "PGRST204",
+            "PGRST205",
+        )
+    )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled update error", exc_info=context.error)
+
+    if not isinstance(update, Update) or not update.effective_message:
+        return
+
+    if _is_schema_error(context.error):
+        await update.effective_message.reply_text(
+            "Бот запущен, но база Supabase ещё не обновлена под Qaiyrat MVP.\n\n"
+            "Нужно открыть Supabase SQL Editor и выполнить текущий `schema.sql`, "
+            "после этого перезапустить bot.py. Сейчас в базе не хватает новых таблиц/колонок."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Внутренняя ошибка. Я записал её в лог, нужно проверить терминал."
+    )
 
 
 async def post_init(app: Application) -> None:
@@ -51,6 +85,7 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
+    app.add_error_handler(error_handler)
 
     app.add_handler(build_onboarding_handler())
     app.add_handler(CommandHandler("help", help_command))
