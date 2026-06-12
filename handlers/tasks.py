@@ -1,319 +1,186 @@
 """
-handlers/tasks.py — команда /tasks
-
-Потоки:
-  /tasks              → список активных задач с кнопками
-  /tasks текст        → сразу добавить задачу
-  callback "tsk_done" → отметить выполненной
-  callback "tsk_del"  → удалить
-  callback "tsk_add"  → кнопка "добавить" из списка
-  callback "tsk_done_list" → показать выполненные
+Simple task management for Qaiyrat MVP.
 """
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from __future__ import annotations
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
+    CommandHandler,
     ContextTypes,
     ConversationHandler,
-    CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
     filters,
 )
+
+from handlers.menu import main_menu_keyboard
 from services.db import (
-    upsert_user,
     add_task,
-    get_tasks,
-    complete_task,
+    complete_task_and_record_win,
     delete_task,
-    add_victory,
+    get_active_tasks,
+    get_mvp_context,
+    mark_user_active,
 )
 
-WAITING_TASK_TEXT = 10   # состояние — ждём текст новой задачи
+WAITING_TASK_TEXT = 1
 
-PRIORITY_EMOJI = {1: "🔴", 2: "🟡", 3: "⚪️"}
-PRIORITY_LABEL = {1: "высокий", 2: "средний", 3: "низкий"}
-
-
-# ══════════════════════════════════════════════════════════
-# УТИЛИТЫ
-# ══════════════════════════════════════════════════════════
 
 def _task_keyboard(task_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Выполнено", callback_data=f"tsk_done:{task_id}"),
-        InlineKeyboardButton("🗑 Удалить",   callback_data=f"tsk_del:{task_id}"),
-    ]])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Готово", callback_data=f"task_done:{task_id}"),
+                InlineKeyboardButton("Удалить", callback_data=f"task_delete:{task_id}"),
+            ]
+        ]
+    )
 
 
-def _main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить задачу",    callback_data="tsk_add")],
-        [InlineKeyboardButton("📋 Выполненные",        callback_data="tsk_done_list")],
-    ])
+async def tasks_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    telegram_id = update.effective_user.id
+    mark_user_active(telegram_id)
+    data = get_mvp_context(telegram_id)
 
-
-def _format_task(t: dict) -> str:
-    priority_em = PRIORITY_EMOJI.get(t.get("priority", 2), "🟡")
-    date = str(t.get("created_at", ""))[:10]
-    text = t["text"]
-    return f"{priority_em} {text}\n<i>добавлена {date}</i>"
-
-
-def _detect_priority(text: str) -> int:
-    """Пытаемся угадать приоритет по ключевым словам."""
-    text_lower = text.lower()
-    if any(w in text_lower for w in ["срочно", "сегодня", "важно", "asap", "deadline"]):
-        return 1
-    if any(w in text_lower for w in ["потом", "когда-нибудь", "не срочно", "позже"]):
-        return 3
-    return 2
-
-
-# ══════════════════════════════════════════════════════════
-# /tasks — главный вход
-# ══════════════════════════════════════════════════════════
-
-async def tasks_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    upsert_user(user.id, user.first_name or "", user.username or "")
-
-    # Если написали /tasks + текст — сразу добавляем
-    text = (update.message.text or "").strip()
-    arg = text.replace("/tasks", "").strip()
-    if arg:
-        return await _save_task(update, ctx, arg)
-
-    return await _show_tasks(update, ctx)
-
-
-async def _show_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    tid = update.effective_user.id
-    tasks = get_tasks(tid, done=False)
-
-    if not tasks:
-        msg = (
-            "✅ <b>Задачи</b>\n\n"
-            "Список пуст — отличный момент чтобы добавить первую.\n\n"
-            "Напиши задачу прямо сейчас или нажми кнопку:"
-        )
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                msg, parse_mode="HTML", reply_markup=_main_keyboard()
-            )
-        else:
-            await update.message.reply_text(
-                msg, parse_mode="HTML", reply_markup=_main_keyboard()
-            )
+    if not data.get("goal"):
+        await update.message.reply_text("Сначала настрой цель через /start.")
         return ConversationHandler.END
 
-    total = len(tasks)
-    high = sum(1 for t in tasks if t.get("priority") == 1)
+    text = update.message.text.strip() if update.message and update.message.text else ""
+    command_arg = text.replace("/tasks", "", 1).strip() if text.startswith("/tasks") else ""
 
-    header = (
-        f"✅ <b>Задачи</b> · {total} активных"
-        + (f" · {high} срочных 🔴" if high else "")
-        + "\n\n"
-    )
+    if command_arg:
+        await _save_task(update, command_arg)
+        return ConversationHandler.END
 
-    # Шлём каждую задачу отдельным сообщением с кнопками
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(
-            header + "⬇️ Листай ниже",
-            parse_mode="HTML",
-            reply_markup=_main_keyboard(),
-        )
-        chat_id = update.callback_query.message.chat_id
-        bot = update.callback_query.message.get_bot()
-    else:
+    if text == "Следующий шаг":
+        tasks = get_active_tasks(telegram_id, limit=1)
+        if tasks:
+            task = tasks[0]
+            await update.message.reply_text(
+                "Следующий шаг:\n\n"
+                f"{task['text']}\n\n"
+                "Сделай это без лишнего анализа. Когда закончишь — нажми «Готово».",
+                reply_markup=_task_keyboard(task["id"]),
+            )
+            return ConversationHandler.END
+
         await update.message.reply_text(
-            header + "⬇️ Листай ниже",
-            parse_mode="HTML",
-            reply_markup=_main_keyboard(),
+            "Активных задач нет. Напиши один следующий шаг на 5-15 минут."
         )
-        chat_id = update.message.chat_id
-        bot = update.message.get_bot()
-
-    for t in tasks:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=_format_task(t),
-            parse_mode="HTML",
-            reply_markup=_task_keyboard(t["id"]),
-        )
-
-    return ConversationHandler.END
-
-
-# ══════════════════════════════════════════════════════════
-# ДОБАВЛЕНИЕ ЗАДАЧИ
-# ══════════════════════════════════════════════════════════
-
-async def _save_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> int:
-    tid = update.effective_user.id
-    priority = _detect_priority(text)
-    task = add_task(tid, text, priority)
-
-    p_em = PRIORITY_EMOJI[priority]
-    p_lb = PRIORITY_LABEL[priority]
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Выполнено", callback_data=f"tsk_done:{task['id']}"),
-        InlineKeyboardButton("🗑 Удалить",   callback_data=f"tsk_del:{task['id']}"),
-    ],[
-        InlineKeyboardButton("➕ Ещё задачу", callback_data="tsk_add"),
-        InlineKeyboardButton("📋 Все задачи", callback_data="tsk_show"),
-    ]])
-
-    msg = (
-        f"➕ <b>Задача добавлена</b>\n\n"
-        f"{p_em} {text}\n"
-        f"<i>Приоритет: {p_lb}</i>"
-    )
-
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_text(
-            msg, parse_mode="HTML", reply_markup=keyboard
-        )
-    else:
-        await update.message.reply_text(
-            msg, parse_mode="HTML", reply_markup=keyboard
-        )
-
-    return ConversationHandler.END
-
-
-async def ask_task_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Нажали кнопку 'Добавить' — просим написать текст."""
-    await update.callback_query.answer()
-    await update.callback_query.message.reply_text(
-        "✏️ <b>Напиши задачу</b>\n\n"
-        "Просто текстом — я добавлю её в список.\n"
-        "<i>Если напишешь «срочно» — поставлю высокий приоритет 🔴</i>",
-        parse_mode="HTML",
-    )
-    return WAITING_TASK_TEXT
-
-
-async def receive_task_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    """Получили текст задачи после нажатия кнопки."""
-    text = (update.message.text or "").strip()
-    if not text:
         return WAITING_TASK_TEXT
-    return await _save_task(update, ctx, text)
+
+    await _show_tasks(update)
+    return ConversationHandler.END
 
 
-# ══════════════════════════════════════════════════════════
-# ВЫПОЛНЕННЫЕ ЗАДАЧИ
-# ══════════════════════════════════════════════════════════
+async def receive_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if not text:
+        await update.message.reply_text("Напиши задачу текстом.")
+        return WAITING_TASK_TEXT
 
-async def show_done_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.callback_query.answer()
-    tid = update.effective_user.id
-    done = get_tasks(tid, done=True)
+    await _save_task(update, text)
+    return ConversationHandler.END
 
-    if not done:
-        await update.callback_query.message.reply_text(
-            "📋 <b>Выполненные задачи</b>\n\n"
-            "Пока пусто — выполни первую задачу из списка 💪",
-            parse_mode="HTML",
+
+async def _save_task(update: Update, text: str) -> None:
+    telegram_id = update.effective_user.id
+    data = get_mvp_context(telegram_id)
+    if not data.get("goal"):
+        await update.message.reply_text("Сначала настрой цель через /start.")
+        return
+
+    task = add_task(telegram_id, text, source="manual")
+    await update.message.reply_text(
+        "Задача добавлена.\n\n"
+        f"{task['text']}",
+        reply_markup=_task_keyboard(task["id"]),
+    )
+
+
+async def _show_tasks(update: Update) -> None:
+    telegram_id = update.effective_user.id
+    tasks = get_active_tasks(telegram_id, limit=20)
+
+    if not tasks:
+        await update.message.reply_text(
+            "Активных задач нет.\n\n"
+            "Добавь одну маленькую задачу так: /tasks написать 3 строки плана",
+            reply_markup=main_menu_keyboard(),
         )
         return
 
-    lines = [f"📋 <b>Выполненные</b> · {len(done)}\n"]
-    for t in done[:20]:
-        done_date = str(t.get("done_at", ""))[:10]
-        lines.append(f"✅ {t['text']} <i>· {done_date}</i>")
-
-    await update.callback_query.message.reply_text(
-        "\n".join(lines),
-        parse_mode="HTML",
+    await update.message.reply_text(
+        f"Мои задачи: {len(tasks)} активных",
+        reply_markup=main_menu_keyboard(),
     )
+    for task in tasks:
+        await update.message.reply_text(task["text"], reply_markup=_task_keyboard(task["id"]))
 
 
-# ══════════════════════════════════════════════════════════
-# CALLBACKS — кнопки ✅ и 🗑
-# ══════════════════════════════════════════════════════════
-
-async def tasks_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    tid = update.effective_user.id
+    telegram_id = update.effective_user.id
     data = query.data
 
-    # ── Показать список ────────────────────────────────────
-    if data == "tsk_show":
-        await _show_tasks(update, ctx)
-        return
-
-    # ── Выполненные ────────────────────────────────────────
-    if data == "tsk_done_list":
-        await show_done_tasks(update, ctx)
-        return
-
-    # ── Добавить (кнопка) — передаём в ConversationHandler ─
-    # (обрабатывается через entry_points)
-    if data == "tsk_add":
-        await ask_task_text(update, ctx)
-        return
-
-    # ── Отметить выполненной ──────────────────────────────
-    if data.startswith("tsk_done:"):
+    if data.startswith("task_done:"):
         task_id = int(data.split(":")[1])
-        task = complete_task(task_id, tid)
+        result = complete_task_and_record_win(task_id, telegram_id)
+        task = result.get("task")
 
         if not task:
-            await query.answer("Задача не найдена", show_alert=True)
+            await query.answer("Задача уже закрыта или не найдена.", show_alert=True)
             return
 
-        # Проверяем — это была важная задача?
-        task_text = task.get("text", "")
-        if task.get("priority") == 1:
-            add_victory(tid, f"Выполнил важную задачу: {task_text}", source="manual")
+        await query.edit_message_reply_markup(reply_markup=None)
 
-        try:
-            # Зачёркиваем текст — редактируем сообщение
-            await query.edit_message_text(
-                f"✅ <s>{task_text}</s>\n<i>Выполнено 🎉</i>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🗑 Удалить", callback_data=f"tsk_del:{task_id}")
-                ]])
+        if task.get("source") == "comeback":
+            await query.message.reply_text(
+                "Вот это и есть возврат. Не настроение решает, а маленькое действие.\n\n"
+                f"Победа сохранена: {task['text']}",
+                reply_markup=main_menu_keyboard(),
             )
-        except Exception:
-            pass
+        else:
+            await query.message.reply_text(
+                f"Готово. Записал как победу: {task['text']}",
+                reply_markup=main_menu_keyboard(),
+            )
         return
 
-    # ── Удалить ────────────────────────────────────────────
-    if data.startswith("tsk_del:"):
+    if data.startswith("task_delete:"):
         task_id = int(data.split(":")[1])
-        delete_task(task_id, tid)
-        try:
-            await query.delete_message()
-        except Exception:
-            await query.edit_message_text("<i>Удалено</i>", parse_mode="HTML")
+        deleted = delete_task(task_id, telegram_id)
+        if not deleted:
+            await query.answer("Задача не найдена.", show_alert=True)
+            return
+        await query.edit_message_text("Задача удалена.")
         return
 
 
-# ══════════════════════════════════════════════════════════
-# СБОРКА ConversationHandler
-# ══════════════════════════════════════════════════════════
+async def cancel_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("Остановил добавление задачи.", reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
 
 def build_tasks_handler() -> ConversationHandler:
     return ConversationHandler(
         entry_points=[
-            CommandHandler("tasks", tasks_start),
-            CallbackQueryHandler(ask_task_text, pattern="^tsk_add$"),
+            CommandHandler("tasks", tasks_entry),
+            MessageHandler(filters.Regex("^(Мои задачи|Следующий шаг)$"), tasks_entry),
         ],
         states={
             WAITING_TASK_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_task_text),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_task_text)
             ],
         },
         fallbacks=[
-            CommandHandler("tasks", tasks_start),
+            CommandHandler("cancel", cancel_tasks),
+            MessageHandler(filters.Regex("^Главное меню$"), cancel_tasks),
         ],
+        name="qaiyrat_tasks",
         allow_reentry=True,
-        name="tasks_conv",
+        per_user=True,
+        per_chat=True,
     )

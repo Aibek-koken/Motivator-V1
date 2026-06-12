@@ -1,14 +1,32 @@
 """
-services/db.py — весь CRUD для Qaiyrat бота.
-Добавлены таблицы: psycho_profile, vision_items.
+Supabase CRUD for the focused Qaiyrat MVP.
+
+The product model is intentionally small:
+- one active goal
+- one accountability profile
+- simple tasks
+- short wins
+- comeback sessions with compact message history
 """
+
+from __future__ import annotations
 
 import os
 import random
-from typing import Optional
-from supabase import create_client, Client
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from supabase import Client, create_client
 
 _client: Optional[Client] = None
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _first(result: Any) -> Optional[dict]:
+    return result.data[0] if getattr(result, "data", None) else None
 
 
 def get_db() -> Client:
@@ -17,273 +35,309 @@ def get_db() -> Client:
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_KEY")
         if not url or not key:
-            raise ValueError("SUPABASE_URL и SUPABASE_KEY должны быть в .env")
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set in .env")
         _client = create_client(url, key)
     return _client
 
 
-# ══════════════════════════════════════════════
-# USERS
-# ══════════════════════════════════════════════
+# Users
+
 
 def upsert_user(telegram_id: int, first_name: str = "", username: str = "") -> dict:
     db = get_db()
-    data = {"telegram_id": telegram_id, "first_name": first_name, "username": username or ""}
-    result = db.table("users").upsert(data, on_conflict="telegram_id").execute()
-    return result.data[0] if result.data else {}
+    payload = {
+        "telegram_id": telegram_id,
+        "first_name": first_name or "",
+        "username": username or "",
+        "last_active_at": _now(),
+    }
+    result = db.table("users").upsert(payload, on_conflict="telegram_id").execute()
+    return _first(result) or {}
+
+
+def mark_user_active(telegram_id: int) -> None:
+    get_db().table("users").update({"last_active_at": _now()}).eq(
+        "telegram_id", telegram_id
+    ).execute()
 
 
 def get_user(telegram_id: int) -> Optional[dict]:
-    db = get_db()
-    result = db.table("users").select("*").eq("telegram_id", telegram_id).execute()
-    return result.data[0] if result.data else None
+    result = get_db().table("users").select("*").eq("telegram_id", telegram_id).execute()
+    return _first(result)
 
 
 def get_all_users() -> list[dict]:
-    db = get_db()
-    return db.table("users").select("telegram_id, first_name").execute().data or []
-
-
-def set_psycho_mode(telegram_id: int, active: bool) -> None:
-    db = get_db()
-    db.table("users").update({"in_psycho_mode": active}).eq("telegram_id", telegram_id).execute()
-
-
-def set_future_mode(telegram_id: int, active: bool) -> None:
-    db = get_db()
-    db.table("users").update({"in_future_mode": active}).eq("telegram_id", telegram_id).execute()
-
-
-def get_psycho_mode(telegram_id: int) -> bool:
-    user = get_user(telegram_id)
-    return user.get("in_psycho_mode", False) if user else False
-
-
-def get_future_mode(telegram_id: int) -> bool:
-    user = get_user(telegram_id)
-    return user.get("in_future_mode", False) if user else False
-
-
-# ══════════════════════════════════════════════
-# PSYCHO PROFILE (онбординг психолога)
-# ══════════════════════════════════════════════
-
-def get_psycho_profile(telegram_id: int) -> Optional[dict]:
-    """Получить психологический профиль пользователя."""
-    db = get_db()
-    result = db.table("psycho_profile").select("*").eq("telegram_id", telegram_id).execute()
-    return result.data[0] if result.data else None
-
-
-def upsert_psycho_profile(telegram_id: int, data: dict) -> dict:
-    """Создать или обновить психологический профиль."""
-    db = get_db()
-    payload = {"telegram_id": telegram_id, **data}
-    result = db.table("psycho_profile").upsert(payload, on_conflict="telegram_id").execute()
-    return result.data[0] if result.data else {}
-
-
-def update_psycho_profile(telegram_id: int, data: dict) -> None:
-    """Обновить отдельные поля психологического профиля."""
-    db = get_db()
-    existing = get_psycho_profile(telegram_id)
-    if existing:
-        db.table("psycho_profile").update(data).eq("telegram_id", telegram_id).execute()
-    else:
-        upsert_psycho_profile(telegram_id, data)
-
-
-# ══════════════════════════════════════════════
-# FUTURE PROFILE (/future — старый онбординг)
-# ══════════════════════════════════════════════
-
-def get_future_profile(telegram_id: int) -> Optional[dict]:
-    db = get_db()
-    result = db.table("future_profile").select("*").eq("telegram_id", telegram_id).execute()
-    return result.data[0] if result.data else None
-
-
-def init_future_profile(telegram_id: int) -> dict:
-    db = get_db()
-    existing = get_future_profile(telegram_id)
-    if existing:
-        return existing
-    result = db.table("future_profile").insert({"telegram_id": telegram_id}).execute()
-    return result.data[0] if result.data else {}
-
-
-def update_future_profile(telegram_id: int, data: dict) -> None:
-    db = get_db()
-    db.table("future_profile").update(data).eq("telegram_id", telegram_id).execute()
-
-
-def append_future_dialog(telegram_id: int, role: str, content: str) -> None:
-    db = get_db()
-    profile = get_future_profile(telegram_id)
-    if not profile:
-        init_future_profile(telegram_id)
-        profile = get_future_profile(telegram_id)
-    history = profile.get("dialog_history") or []
-    history.append({"role": role, "content": content})
-    db.table("future_profile").update({"dialog_history": history}).eq("telegram_id", telegram_id).execute()
-
-
-def complete_future_profile(telegram_id: int) -> None:
-    db = get_db()
-    db.table("future_profile").update({"is_complete": True}).eq("telegram_id", telegram_id).execute()
-
-
-# ══════════════════════════════════════════════
-# VISION ITEMS (визуализатор будущего)
-# ══════════════════════════════════════════════
-
-def get_vision_items(telegram_id: int) -> list[dict]:
-    """Получить все элементы доски будущего."""
-    db = get_db()
     result = (
-        db.table("vision_items")
-        .select("*")
-        .eq("telegram_id", telegram_id)
-        .order("created_at", desc=False)
+        get_db()
+        .table("users")
+        .select("telegram_id, first_name, onboarding_completed")
+        .eq("onboarding_completed", True)
         .execute()
     )
     return result.data or []
 
 
-def add_vision_item(telegram_id: int, category: str, content: str) -> dict:
-    """Добавить элемент на доску будущего."""
-    db = get_db()
-    result = db.table("vision_items").insert({
-        "telegram_id": telegram_id,
-        "category": category,
-        "content": content,
-    }).execute()
-    return result.data[0] if result.data else {}
+def set_onboarding_completed(telegram_id: int, completed: bool = True) -> None:
+    get_db().table("users").update(
+        {"onboarding_completed": completed, "last_active_at": _now()}
+    ).eq("telegram_id", telegram_id).execute()
 
 
-def delete_vision_item(item_id: int, telegram_id: int) -> bool:
-    """Удалить элемент (только свой)."""
-    db = get_db()
-    result = db.table("vision_items").delete().eq("id", item_id).eq("telegram_id", telegram_id).execute()
-    return bool(result.data)
+def _bump_user_counter(telegram_id: int, field: str) -> None:
+    user = get_user(telegram_id) or {}
+    current = user.get(field) or 0
+    get_db().table("users").update({field: current + 1, "last_active_at": _now()}).eq(
+        "telegram_id", telegram_id
+    ).execute()
 
 
-def update_vision_item(item_id: int, telegram_id: int, content: str) -> None:
-    """Обновить текст элемента."""
-    db = get_db()
-    db.table("vision_items").update({"content": content}).eq("id", item_id).eq("telegram_id", telegram_id).execute()
+# Goals and profiles
 
 
-# ══════════════════════════════════════════════
-# MEMORIES
-# ══════════════════════════════════════════════
-
-def add_memory(telegram_id: int, type_: str, content: str, caption: str = "") -> dict:
-    db = get_db()
-    result = db.table("memories").insert({
-        "telegram_id": telegram_id,
-        "type": type_,
-        "content": content,
-        "caption": caption or "",
-    }).execute()
-    return result.data[0] if result.data else {}
-
-
-def get_memories(telegram_id: int, type_: str = None, limit: int = 10) -> list[dict]:
-    db = get_db()
-    query = db.table("memories").select("*").eq("telegram_id", telegram_id)
-    if type_:
-        query = query.eq("type", type_)
-    result = query.order("is_pinned", desc=True).order("created_at", desc=True).limit(limit).execute()
-    return result.data or []
-
-
-def pin_memory(memory_id: int, pinned: bool = True) -> None:
-    db = get_db()
-    db.table("memories").update({"is_pinned": pinned}).eq("id", memory_id).execute()
-
-
-def delete_memory(memory_id: int, telegram_id: int) -> bool:
-    db = get_db()
-    result = db.table("memories").delete().eq("id", memory_id).eq("telegram_id", telegram_id).execute()
-    return bool(result.data)
-
-
-# ══════════════════════════════════════════════
-# TASKS
-# ══════════════════════════════════════════════
-
-def add_task(telegram_id: int, text: str, priority: int = 2) -> dict:
-    db = get_db()
-    result = db.table("tasks").insert({
-        "telegram_id": telegram_id,
-        "text": text,
-        "priority": priority,
-    }).execute()
-    return result.data[0] if result.data else {}
-
-
-def get_tasks(telegram_id: int, done: bool = False) -> list[dict]:
-    db = get_db()
-    result = (
-        db.table("tasks")
+def get_active_goal(telegram_id: int) -> Optional[dict]:
+    query = (
+        get_db()
+        .table("goals")
         .select("*")
         .eq("telegram_id", telegram_id)
-        .eq("is_done", done)
-        .order("priority", desc=False)
+        .eq("is_active", True)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if query.data:
+        return query.data[0]
+
+    fallback = (
+        get_db()
+        .table("goals")
+        .select("*")
+        .eq("telegram_id", telegram_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return _first(fallback)
+
+
+def create_goal(telegram_id: int, title: str, deadline: str, why: str) -> dict:
+    db = get_db()
+    db.table("goals").update({"is_active": False}).eq("telegram_id", telegram_id).eq(
+        "is_active", True
+    ).execute()
+    result = (
+        db.table("goals")
+        .insert(
+            {
+                "telegram_id": telegram_id,
+                "title": title.strip(),
+                "deadline": deadline.strip(),
+                "why": why.strip(),
+                "is_active": True,
+            }
+        )
+        .execute()
+    )
+    return _first(result) or {}
+
+def update_active_goal(telegram_id: int, data: dict) -> None:
+    goal = get_active_goal(telegram_id)
+    if not goal:
+        return
+    allowed = {k: v for k, v in data.items() if k in {"title", "deadline", "why"}}
+    if allowed:
+        get_db().table("goals").update(allowed).eq("id", goal["id"]).execute()
+
+
+def get_user_profile(telegram_id: int) -> Optional[dict]:
+    result = (
+        get_db()
+        .table("user_profiles")
+        .select("*")
+        .eq("telegram_id", telegram_id)
+        .execute()
+    )
+    return _first(result)
+
+
+def upsert_user_profile(
+    telegram_id: int,
+    blocker_pattern: str,
+    support_tone: str,
+) -> dict:
+    result = (
+        get_db()
+        .table("user_profiles")
+        .upsert(
+            {
+                "telegram_id": telegram_id,
+                "blocker_pattern": blocker_pattern.strip(),
+                "support_tone": support_tone.strip(),
+            },
+            on_conflict="telegram_id",
+        )
+        .execute()
+    )
+    return _first(result) or {}
+
+
+def complete_onboarding(
+    telegram_id: int,
+    goal_title: str,
+    deadline: str,
+    why: str,
+    blocker_pattern: str,
+    support_tone: str,
+    first_task: str,
+) -> dict:
+    goal = create_goal(telegram_id, goal_title, deadline, why)
+    profile = upsert_user_profile(telegram_id, blocker_pattern, support_tone)
+    set_onboarding_completed(telegram_id, True)
+
+    task = None
+    if first_task.strip():
+        task = add_task(
+            telegram_id=telegram_id,
+            text=first_task,
+            source="onboarding",
+            goal_id=goal.get("id"),
+        )
+
+    return {"goal": goal, "profile": profile, "first_task": task}
+
+
+def get_mvp_context(telegram_id: int) -> dict:
+    return {
+        "user": get_user(telegram_id) or {},
+        "goal": get_active_goal(telegram_id) or {},
+        "profile": get_user_profile(telegram_id) or {},
+        "vision_items": get_vision_items(telegram_id),
+    }
+
+
+# Tasks
+
+
+def add_task(
+    telegram_id: int,
+    text: str,
+    source: str = "manual",
+    goal_id: Optional[int] = None,
+    comeback_session_id: Optional[int] = None,
+) -> dict:
+    goal = {"id": goal_id} if goal_id else get_active_goal(telegram_id)
+    payload = {
+        "telegram_id": telegram_id,
+        "goal_id": goal.get("id") if goal else None,
+        "text": text.strip(),
+        "status": "active",
+        "source": source,
+        "comeback_session_id": comeback_session_id,
+    }
+    result = get_db().table("tasks").insert(payload).execute()
+    return _first(result) or {}
+
+
+def get_tasks(telegram_id: int, status: str = "active", limit: int = 20) -> list[dict]:
+    result = (
+        get_db()
+        .table("tasks")
+        .select("*")
+        .eq("telegram_id", telegram_id)
+        .eq("status", status)
         .order("created_at", desc=False)
+        .limit(limit)
         .execute()
     )
     return result.data or []
+
+
+def get_active_tasks(telegram_id: int, limit: int = 5) -> list[dict]:
+    return get_tasks(telegram_id, status="active", limit=limit)
 
 
 def complete_task(task_id: int, telegram_id: int) -> Optional[dict]:
-    db = get_db()
-    from datetime import datetime, timezone
-    result = db.table("tasks").update({
-        "is_done": True,
-        "done_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", task_id).eq("telegram_id", telegram_id).execute()
-    return result.data[0] if result.data else None
+    result = (
+        get_db()
+        .table("tasks")
+        .update({"status": "completed", "completed_at": _now()})
+        .eq("id", task_id)
+        .eq("telegram_id", telegram_id)
+        .eq("status", "active")
+        .execute()
+    )
+    task = _first(result)
+    if task:
+        _bump_user_counter(telegram_id, "completed_task_count")
+    return task
 
 
 def delete_task(task_id: int, telegram_id: int) -> bool:
-    db = get_db()
-    result = db.table("tasks").delete().eq("id", task_id).eq("telegram_id", telegram_id).execute()
+    result = (
+        get_db()
+        .table("tasks")
+        .update({"status": "deleted", "deleted_at": _now()})
+        .eq("id", task_id)
+        .eq("telegram_id", telegram_id)
+        .eq("status", "active")
+        .execute()
+    )
     return bool(result.data)
 
 
-def update_task_message_id(task_id: int, message_id: int) -> None:
-    db = get_db()
-    db.table("tasks").update({"message_id": message_id}).eq("id", task_id).execute()
+def complete_task_and_record_win(task_id: int, telegram_id: int) -> dict:
+    task = complete_task(task_id, telegram_id)
+    if not task:
+        return {"task": None, "win": None}
+
+    source = "comeback" if task.get("source") == "comeback" else "task"
+    win_text = f"Сделал: {task.get('text', '').strip()}"
+    win = add_win(
+        telegram_id=telegram_id,
+        text=win_text,
+        source=source,
+        goal_id=task.get("goal_id"),
+        task_id=task.get("id"),
+    )
+
+    if task.get("source") == "comeback":
+        complete_comeback_session_by_task(task["id"], telegram_id)
+
+    return {"task": task, "win": win}
 
 
-# ══════════════════════════════════════════════
-# VICTORIES (Cookie Jar)
-# ══════════════════════════════════════════════
-
-def add_victory(telegram_id: int, text: str, source: str = "manual") -> dict:
-    db = get_db()
-    result = db.table("victories").insert({
-        "telegram_id": telegram_id,
-        "text": text,
-        "source": source,
-    }).execute()
-    return result.data[0] if result.data else {}
+# Wins
 
 
-def get_random_victory(telegram_id: int) -> Optional[str]:
-    db = get_db()
-    result = db.table("victories").select("text").eq("telegram_id", telegram_id).execute()
-    if not result.data:
-        return None
-    return random.choice(result.data)["text"]
-
-
-def get_victories(telegram_id: int, limit: int = 5) -> list[dict]:
-    db = get_db()
+def add_win(
+    telegram_id: int,
+    text: str,
+    source: str = "manual",
+    goal_id: Optional[int] = None,
+    task_id: Optional[int] = None,
+) -> dict:
+    goal = {"id": goal_id} if goal_id else get_active_goal(telegram_id)
     result = (
-        db.table("victories")
+        get_db()
+        .table("wins")
+        .insert(
+            {
+                "telegram_id": telegram_id,
+                "goal_id": goal.get("id") if goal else None,
+                "task_id": task_id,
+                "text": text.strip(),
+                "source": source,
+            }
+        )
+        .execute()
+    )
+    return _first(result) or {}
+
+
+def get_recent_wins(telegram_id: int, limit: int = 5) -> list[dict]:
+    result = (
+        get_db()
+        .table("wins")
         .select("*")
         .eq("telegram_id", telegram_id)
         .order("created_at", desc=True)
@@ -293,75 +347,180 @@ def get_victories(telegram_id: int, limit: int = 5) -> list[dict]:
     return result.data or []
 
 
-# ══════════════════════════════════════════════
-# PSYCHO SESSIONS
-# ══════════════════════════════════════════════
-
-def start_psycho_session(telegram_id: int) -> dict:
-    db = get_db()
-    result = db.table("psycho_sessions").insert({"telegram_id": telegram_id}).execute()
-    return result.data[0] if result.data else {}
+def get_random_win(telegram_id: int) -> Optional[str]:
+    wins = get_recent_wins(telegram_id, limit=50)
+    return random.choice(wins)["text"] if wins else None
 
 
-def get_active_psycho_session(telegram_id: int) -> Optional[dict]:
-    db = get_db()
+# Comeback sessions
+
+
+def create_comeback_session(
+    telegram_id: int,
+    trigger_reason: str,
+    days_slipped: str,
+    blocker: str,
+) -> dict:
+    goal = get_active_goal(telegram_id)
     result = (
-        db.table("psycho_sessions")
+        get_db()
+        .table("comeback_sessions")
+        .insert(
+            {
+                "telegram_id": telegram_id,
+                "goal_id": goal.get("id") if goal else None,
+                "status": "active",
+                "trigger_reason": trigger_reason.strip(),
+                "days_slipped": days_slipped.strip(),
+                "blocker": blocker.strip(),
+            }
+        )
+        .execute()
+    )
+    session = _first(result) or {}
+    if session:
+        _bump_user_counter(telegram_id, "comeback_session_count")
+    return session
+
+
+def get_comeback_session(session_id: int, telegram_id: int) -> Optional[dict]:
+    result = (
+        get_db()
+        .table("comeback_sessions")
         .select("*")
+        .eq("id", session_id)
         .eq("telegram_id", telegram_id)
-        .is_("ended_at", "null")
-        .order("started_at", desc=True)
+        .execute()
+    )
+    return _first(result)
+
+
+def update_comeback_session(session_id: int, telegram_id: int, data: dict) -> None:
+    if data:
+        get_db().table("comeback_sessions").update(data).eq("id", session_id).eq(
+            "telegram_id", telegram_id
+        ).execute()
+
+
+def add_comeback_message(
+    session_id: int,
+    telegram_id: int,
+    role: str,
+    content: str,
+) -> dict:
+    result = (
+        get_db()
+        .table("comeback_messages")
+        .insert(
+            {
+                "session_id": session_id,
+                "telegram_id": telegram_id,
+                "role": role,
+                "content": content.strip(),
+            }
+        )
+        .execute()
+    )
+    return _first(result) or {}
+
+
+def mark_comeback_proposed(
+    session_id: int,
+    telegram_id: int,
+    ai_response: str,
+    proposed_action: str,
+) -> None:
+    update_comeback_session(
+        session_id,
+        telegram_id,
+        {
+            "status": "proposed",
+            "ai_response": ai_response,
+            "proposed_action": proposed_action,
+        },
+    )
+
+
+def commit_comeback_session(
+    session_id: int,
+    telegram_id: int,
+    task_id: int,
+) -> None:
+    update_comeback_session(
+        session_id,
+        telegram_id,
+        {"status": "committed", "task_id": task_id, "committed_at": _now()},
+    )
+
+
+def complete_comeback_session_by_task(task_id: int, telegram_id: int) -> None:
+    result = (
+        get_db()
+        .table("comeback_sessions")
+        .select("id")
+        .eq("task_id", task_id)
+        .eq("telegram_id", telegram_id)
         .limit(1)
         .execute()
     )
-    return result.data[0] if result.data else None
+    session = _first(result)
+    if session:
+        update_comeback_session(
+            session["id"],
+            telegram_id,
+            {"status": "completed", "completed_at": _now()},
+        )
 
 
-def append_psycho_dialog(session_id: int, role: str, content: str) -> None:
-    db = get_db()
-    session = db.table("psycho_sessions").select("dialog_history, message_count").eq("id", session_id).execute()
-    if not session.data:
-        return
-    history = session.data[0].get("dialog_history") or []
-    count = session.data[0].get("message_count") or 0
-    history.append({"role": role, "content": content})
-    db.table("psycho_sessions").update({
-        "dialog_history": history,
-        "message_count": count + 1,
-    }).eq("id", session_id).execute()
+# Simple future context
 
 
-def end_psycho_session(session_id: int, mood_after: int = None) -> None:
-    db = get_db()
-    from datetime import datetime, timezone
-    data = {"ended_at": datetime.now(timezone.utc).isoformat()}
-    if mood_after:
-        data["mood_after"] = mood_after
-    db.table("psycho_sessions").update(data).eq("id", session_id).execute()
+def get_vision_items(telegram_id: int) -> list[dict]:
+    result = (
+        get_db()
+        .table("vision_items")
+        .select("*")
+        .eq("telegram_id", telegram_id)
+        .order("created_at", desc=False)
+        .execute()
+    )
+    return result.data or []
 
 
-def update_psycho_mood_before(session_id: int, mood: int) -> None:
-    db = get_db()
-    db.table("psycho_sessions").update({"mood_before": mood}).eq("id", session_id).execute()
+def upsert_vision_item(telegram_id: int, kind: str, content: str) -> dict:
+    goal = get_active_goal(telegram_id)
+    result = (
+        get_db()
+        .table("vision_items")
+        .upsert(
+            {
+                "telegram_id": telegram_id,
+                "goal_id": goal.get("id") if goal else None,
+                "kind": kind,
+                "content": content.strip(),
+            },
+            on_conflict="telegram_id,kind",
+        )
+        .execute()
+    )
+    return _first(result) or {}
 
 
-# ══════════════════════════════════════════════
-# DAILY CHECK-IN
-# ══════════════════════════════════════════════
-
-def save_checkin(telegram_id: int, question: str) -> dict:
-    db = get_db()
-    result = db.table("daily_checkins").insert({
-        "telegram_id": telegram_id,
-        "question": question,
-    }).execute()
-    return result.data[0] if result.data else {}
+# Check-ins are intentionally not scheduled in the MVP, but the table exists
+# for future reminders and simple analytics.
 
 
-def answer_checkin(checkin_id: int, answer: str) -> None:
-    from datetime import datetime, timezone
-    db = get_db()
-    db.table("daily_checkins").update({
-        "answer": answer,
-        "answered_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", checkin_id).execute()
+def save_checkin(telegram_id: int, question: str, answer: str = "") -> dict:
+    result = (
+        get_db()
+        .table("checkins")
+        .insert(
+            {
+                "telegram_id": telegram_id,
+                "question": question.strip(),
+                "answer": answer.strip() or None,
+            }
+        )
+        .execute()
+    )
+    return _first(result) or {}

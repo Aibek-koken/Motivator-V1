@@ -1,100 +1,121 @@
-# AnchorAI — Telegram Bot
+# Qaiyrat — Telegram Accountability Coach
 
-Возвращает пользователя к его цели в момент потери мотивации.
+Qaiyrat is a focused Telegram MVP for ambitious students and junior IT people who are close to dropping a near-term goal.
 
-## Как запустить за 15 минут
+It is not a psychologist or therapist. The bot acts as an AI accountability coach: when the user feels they are slipping, it helps them return to one small action in 3-5 minutes.
 
-### 1. Получи токены (5 мин)
+## Core Flow
 
-**Telegram Bot:**
-- Открой @BotFather в Telegram
-- Напиши `/newbot` → придумай имя → получи токен
+1. User completes `/start` onboarding in under 2 minutes.
+2. User presses `Я выпал`.
+3. Qaiyrat asks what happened, how many days they stopped, and what blocks them now.
+4. Groq generates one short comeback response with one 5-15 minute action.
+5. If the user commits, Qaiyrat creates a task.
+6. When the user marks it `Готово`, the task is completed and saved as a win.
 
-**Anthropic API:**
-- Зайди на [console.anthropic.com](https://console.anthropic.com)
-- Settings → API Keys → Create Key
+## Commands And Buttons
 
-**Supabase:**
-- Зайди на [supabase.com](https://supabase.com) → New Project
-- Settings → API → скопируй URL и anon key
-- Открой SQL Editor → вставь содержимое `schema.sql` → Run
+- `/start` — create or reopen the Qaiyrat profile.
+- `/help` — explain the bot and safety boundary.
+- `/menu` — show the main menu.
+- `/tasks` — list tasks. Use `/tasks текст задачи` to add one directly.
+- `Я выпал` — start a comeback session.
+- `Следующий шаг` — show the next active task or add one if the list is empty.
+- `Добавить победу` — save a short win.
+- `Мои задачи` — list active tasks.
+- `Моя цель` — show the goal, deadline, why, blocker pattern, and tone.
 
----
+## Stack
 
-### 2. Установи зависимости
+- Python 3.11+
+- python-telegram-bot
+- Supabase
+- PostgreSQL through Supabase
+- Groq API
+- Long polling
+
+## Setup
+
+### 1. Create Credentials
+
+Telegram:
+
+- Open `@BotFather`
+- Create a bot with `/newbot`
+- Copy the Telegram token
+
+Groq:
+
+- Create an API key in the Groq console
+- Copy the key into `GROQ_API_KEY`
+
+Supabase:
+
+- Create a Supabase project
+- Open SQL Editor
+- Run the full contents of `schema.sql`
+- Copy Project URL and anon/service key into `.env`
+
+### 2. Install Dependencies
 
 ```bash
-cd anchorai
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
----
-
-### 3. Настрой .env
+### 3. Configure Environment
 
 ```bash
 cp .env.example .env
-# Открой .env и заполни все значения
 ```
 
----
-
-### 4. Запусти
+Fill:
 
 ```bash
-python -m dotenv run python bot.py
+TELEGRAM_BOT_TOKEN=
+GROQ_API_KEY=
+SUPABASE_URL=
+SUPABASE_KEY=
 ```
 
-Или если python-dotenv установлен глобально:
+Optional:
+
 ```bash
-python bot.py
+GROQ_MODEL=llama-3.3-70b-versatile
 ```
 
----
+### 4. Run
 
-## Структура
-
-```
-anchorai/
-├── bot.py                  # Точка входа, регистрация хендлеров
-├── requirements.txt
-├── schema.sql              # SQL для Supabase
-├── .env.example
-├── handlers/
-│   ├── onboarding.py       # 4-шаговый онбординг
-│   ├── sos.py              # SOS-режим + /anchor
-│   └── daily.py            # Ежедневный чек-ин (20:00 Алматы)
-└── services/
-    ├── ai.py               # Claude API — генерация ответов
-    └── db.py               # Supabase — хранение профилей и побед
+```bash
+python3 bot.py
 ```
 
----
+## Project Structure
 
-## Как работает
+```text
+bot.py                    # entrypoint and handler registration
+schema.sql                # Supabase schema for the MVP
+handlers/
+  onboarding.py           # short /start onboarding
+  comeback.py             # "Я выпал" comeback session
+  tasks.py                # simple tasks
+  wins.py                 # manual win capture
+  menu.py                 # /help, /menu, goal summary
+services/
+  ai.py                   # Groq comeback prompt and fallback
+  db.py                   # Supabase CRUD
+```
 
-**Онбординг** (`/start`):
-1. Чего ты хочешь?
-2. Почему это важно?
-3. Вспомни момент когда ты не сдался
-4. Фото или образ (необязательно)
+Legacy memory, future-board, psycho, daily, and SOS handlers were removed from the active MVP surface.
 
-**SOS-режим** (автоматически):
-Пользователь пишет «плохо», «не могу», «хочу бросить» → бот отвечает по формуле:
-`Принять боль → Нормализовать → Якорь из архива → Одно действие`
+## Safety Boundary
 
-**Ежедневный вопрос** (20:00):
-Один вопрос чтобы пополнить архив побед. Ответ сохраняется.
+If the user mentions self-harm, suicide, abuse, or severe crisis, Qaiyrat stops coaching and shows a safety message that encourages contacting emergency services, a trusted person, or a local crisis line.
 
-**Команда `/anchor`**:
-Пользователь сам может запросить напоминание о своей цели.
+## Tests
 
----
-
-## Следующие шаги (после MVP)
-
-- [ ] Веб-архив побед (просмотр всех записей)
-- [ ] Умные триггеры (вечер воскресенья, после пропуска дня)
-- [ ] Фото-якорь (бот присылает загруженное фото в SOS-момент)
-- [ ] Выбор языка (русский / казахский / английский)
-- [ ] Оплата (Telegram Stars или Stripe)
+```bash
+python3 -m unittest discover -s tests
+PYTHONPYCACHEPREFIX=/tmp/qaiyrat_pycache python3 -m compileall bot.py handlers services tests
+```
